@@ -3,3 +3,8 @@ torchvision
 numpy
 Pillow
 matplotlib
+torch
+torchvision
+numpy
+Pillow
+matplotlib
