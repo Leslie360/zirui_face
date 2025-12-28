@@ -10,6 +10,78 @@ from data_loader import get_cifar10_loaders
 from memristor_model import MemristorModel
 
 
+import torch.nn.functional as F
+
+# ============================================================
+# 0a) Loss Functions
+# ============================================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both labels and mask')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        mask = mask.repeat(anchor_count, contrast_count)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        loss = - (self.temperature / 0.07) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
 # ============================================================
 # 0) Utilities: access classifier Linear layers
 # ============================================================
@@ -81,22 +153,36 @@ def build_g_states_per_color(ltp_rgb: dict, ltd_rgb: dict):
 # 3) Memristor FCL state + update
 # ============================================================
 class MemFCLState:
-    def __init__(self, g_states_color: dict, max_pulses_per_step: int = 1, color_mapping: str = "round_robin"):
+    def __init__(self, g_states_color: dict, max_pulses_per_step: int = 1, color_mapping: str = "round_robin", device=None):
+        self.device = device if device is not None else torch.device("cpu")
         # stack per-color states to allow fast indexing
         g_r, g_g, g_b = g_states_color["r"], g_states_color["g"], g_states_color["b"]
         min_len = min(g_r.size, g_g.size, g_b.size)
         self.N = int(min_len)
-        self.g_stack = np.stack([
+        
+        # Convert to torch tensor on device
+        g_stack_np = np.stack([
             g_r[:min_len],
             g_g[:min_len],
             g_b[:min_len],
-        ], axis=0).astype(float)  # shape (3,N)
+        ], axis=0).astype(np.float32)  # shape (3,N)
+        
+        self.g_stack = torch.from_numpy(g_stack_np).to(self.device)
+        
         self.g_min = float(self.g_stack.min())
         self.g_max = float(self.g_stack.max())
         self.g_range = max(self.g_max - self.g_min, 1e-30)
+        
+        # Calculate step scalar
         self.g_step_scalar = (self.g_stack[:, -1] - self.g_stack[:, 0]) / max(self.N - 1, 1)
+        
         self.max_pulses = int(max_pulses_per_step)
         self.color_mapping = color_mapping
+
+        # Variation parameters (default 0.0 means no variation)
+        self.c2c_variation = 0.0  # Cycle-to-cycle variation (relative std dev)
+        self.d2d_variation = 0.0  # Device-to-device variation (not implemented yet)
+        self.stochastic_rounding = True # Use stochastic rounding for small updates
 
         self.layers = {}
         self._pulse_sum = 0.0
@@ -113,26 +199,34 @@ class MemFCLState:
 
     def _color_indices(self, shape, strategy="round_robin"):
         rows, cols = shape
-        color_idx = np.zeros(shape, dtype=np.int32)
+        # Create on device directly
         if strategy == "round_robin":
-            for i in range(rows):
-                for j in range(cols):
-                    color_idx[i, j] = (i * cols + j) % 3
+            # Using torch meshgrid or similar to create indices
+            # (i * cols + j) % 3
+            # i: (rows, 1), j: (1, cols)
+            i = torch.arange(rows, device=self.device).view(-1, 1)
+            j = torch.arange(cols, device=self.device).view(1, -1)
+            color_idx = (i * cols + j) % 3
         elif strategy == "blocks":
-            for j in range(cols):
-                block = int(j * 3 / max(1, cols))
-                color_idx[:, j] = min(block, 2)
+            # block = int(j * 3 / max(1, cols))
+            j = torch.arange(cols, device=self.device).view(1, -1)
+            block = (j * 3 / max(1, cols)).long()
+            block = torch.clamp(block, max=2)
+            color_idx = block.expand(rows, cols)
         else:
-            color_idx[:] = 0
-        return color_idx
+            color_idx = torch.zeros(shape, dtype=torch.long, device=self.device)
+        return color_idx.long()
 
     def init_layer_from_float(self, name: str, W_float: np.ndarray, scale_factor: float = 1.0):
-        W = W_float.astype(float)
+        # W_float is numpy, convert to torch
+        W = torch.from_numpy(W_float).float().to(self.device)
         mid = (self.N - 1) // 2
 
-        w_abs_p99 = float(np.percentile(np.abs(W), 99))
+        w_abs = torch.abs(W)
+        w_abs_p99 = torch.quantile(w_abs, 0.99).item()
+        
         if w_abs_p99 < 1e-12:
-            w_abs_p99 = float(np.std(W) + 1e-6)
+            w_abs_p99 = float(torch.std(W) + 1e-6)
         S = (2.0 * w_abs_p99) / self.g_range
         S = S * max(scale_factor, 1e-12)
         S = max(S, 1e-12)
@@ -141,18 +235,18 @@ class MemFCLState:
         g_step = self.g_step_scalar[color_idx]
 
         deltaG = W / S
-        steps = np.rint(deltaG / g_step).astype(np.int32)
+        steps = torch.round(deltaG / g_step).int()
 
-        idx_p = np.full_like(steps, mid, dtype=np.int32)
-        idx_n = np.full_like(steps, mid, dtype=np.int32)
+        idx_p = torch.full_like(steps, mid)
+        idx_n = torch.full_like(steps, mid)
 
         pos = steps > 0
         neg = steps < 0
         idx_p[pos] = idx_p[pos] + steps[pos]
         idx_n[neg] = idx_n[neg] + (-steps[neg])
 
-        idx_p = np.clip(idx_p, 0, self.N - 1)
-        idx_n = np.clip(idx_n, 0, self.N - 1)
+        idx_p = torch.clamp(idx_p, 0, self.N - 1)
+        idx_n = torch.clamp(idx_n, 0, self.N - 1)
 
         self.layers[name] = {
             "idx_p": idx_p,
@@ -162,7 +256,8 @@ class MemFCLState:
             "color_idx": color_idx,
         }
 
-    def _indices_to_weight(self, idx_p: np.ndarray, idx_n: np.ndarray, scale: float, color_idx: np.ndarray):
+    def _indices_to_weight(self, idx_p, idx_n, scale, color_idx):
+        # All inputs are torch tensors
         Gp = self.g_stack[color_idx, idx_p]
         Gn = self.g_stack[color_idx, idx_n]
         return (Gp - Gn) * scale
@@ -170,15 +265,12 @@ class MemFCLState:
     def writeback(self, name: str, W_tensor: torch.Tensor):
         info = self.layers[name]
         W = self._indices_to_weight(info["idx_p"], info["idx_n"], info["scale"], info["color_idx"])
-        W_tensor.data.copy_(torch.from_numpy(W).to(W_tensor.device, dtype=W_tensor.dtype))
+        W_tensor.data.copy_(W)
 
-    def update(self, name: str, grad_W: np.ndarray, lr: float, mode: str):
+    def update(self, name: str, grad_W: torch.Tensor, lr: float, mode: str):
         """
         Update idx_p/idx_n according to deltaW = -lr * grad.
         pulses computed from deltaG = |deltaW|/S and g_step.
-        mode:
-          - 'unidir': only allow idx += pulses (potentiation only) on either plus or minus side
-          - 'bidir' : allow idx += pulses (pot) and idx -= pulses (dep) depending on need
         """
         info = self.layers[name]
         idx_p = info["idx_p"]
@@ -186,14 +278,43 @@ class MemFCLState:
         color_idx = info["color_idx"]
         S = float(info["scale"])
 
-        deltaW = (-lr) * grad_W.astype(float)
-        deltaG = np.abs(deltaW) / max(S, 1e-30)
+        # Ensure grad_W is on the correct device
+        if grad_W.device != self.device:
+            grad_W = grad_W.to(self.device)
+
+        deltaW = (-lr) * grad_W
+        deltaG = torch.abs(deltaW) / max(S, 1e-30)
         g_step = self.g_step_scalar[color_idx]
-        pulses = np.rint(deltaG / np.maximum(g_step, 1e-30)).astype(np.int32)
-        pulses = np.clip(pulses, 0, self.max_pulses)
+        
+        # Calculate raw pulses needed
+        raw_pulses = deltaG / torch.clamp(g_step, min=1e-30)
+        
+        # Add Cycle-to-Cycle Variation (noise on number of pulses or effective update?)
+        if self.c2c_variation > 0:
+            # Noise is proportional to the number of pulses
+            noise = torch.randn_like(raw_pulses) * self.c2c_variation * torch.abs(raw_pulses)
+            raw_pulses = raw_pulses + noise
+
+        # Stochastic Rounding or Standard Rounding
+        if self.stochastic_rounding:
+            # floor + bernoulli(remainder)
+            pulses_floor = torch.floor(raw_pulses)
+            remainder = raw_pulses - pulses_floor
+            mask = torch.rand_like(remainder) < remainder
+            pulses = pulses_floor + mask.float()
+            pulses = pulses.int()
+        else:
+            pulses = torch.round(raw_pulses).int()
+
+        # Add Cycle-to-Cycle Variation (noise on number of pulses or effective update?)
+        # Typically C2C affects the conductance change, but here we update by integer steps.
+        # We can model it as noise on the 'raw_pulses' before rounding.
+        # (Variation logic moved before rounding)
+
+        pulses = torch.clamp(pulses, 0, self.max_pulses)
 
         # pulse stats
-        self._pulse_sum += float(np.mean(pulses))
+        self._pulse_sum += float(torch.mean(pulses.float()))
         self._pulse_count += 1
 
         if mode not in ("unidir", "bidir"):
@@ -209,8 +330,6 @@ class MemFCLState:
 
         else:
             # bidirectional:
-            # deltaW > 0: prefer increase G+; if saturated then decrease G- (idx_n -=)
-            # deltaW < 0: prefer increase G-; if saturated then decrease G+ (idx_p -=)
             pos = deltaW > 0
             neg = deltaW < 0
 
@@ -228,8 +347,9 @@ class MemFCLState:
             fallback_neg = neg & ~inc_n
             idx_p[fallback_neg] -= pulses[fallback_neg]
 
-        info["idx_p"] = np.clip(idx_p, 0, self.N - 1)
-        info["idx_n"] = np.clip(idx_n, 0, self.N - 1)
+        # In-place update of info dict tensors
+        info["idx_p"] = torch.clamp(idx_p, 0, self.N - 1)
+        info["idx_n"] = torch.clamp(idx_n, 0, self.N - 1)
 
 
 def build_optimizer_conv_and_bias(model: nn.Module, lr: float):
@@ -240,6 +360,8 @@ def build_optimizer_conv_and_bias(model: nn.Module, lr: float):
     """
     fc1, fc2 = get_fc_linears(model)
     fc_weight_ids = {id(fc1.weight), id(fc2.weight)}
+    
+    opt_type = getattr(cfg, "OPTIMIZER", "sgd").lower()
 
     params = []
     for p in model.parameters():
@@ -247,7 +369,13 @@ def build_optimizer_conv_and_bias(model: nn.Module, lr: float):
             continue
         params.append(p)
 
-    opt = optim.SGD(params, lr=lr, momentum=0.9, weight_decay=getattr(cfg, "WEIGHT_DECAY", 0.0))
+    if opt_type == "adamw":
+        opt = optim.AdamW(params, lr=lr, weight_decay=getattr(cfg, "WEIGHT_DECAY", 1e-4))
+    elif opt_type == "adam":
+        opt = optim.Adam(params, lr=lr, weight_decay=getattr(cfg, "WEIGHT_DECAY", 1e-4))
+    else:
+        # SGD default
+        opt = optim.SGD(params, lr=lr, momentum=0.9, weight_decay=getattr(cfg, "WEIGHT_DECAY", 5e-4))
     return opt
 
 
@@ -259,27 +387,63 @@ def train_one_epoch(model, loader, criterion, optimizer, device, fcl_state: MemF
     correct, total = 0, 0
     running_loss = 0.0
 
+    # Initialize custom losses
+    supcon_criterion = SupConLoss().to(device)
+    focal_criterion = FocalLoss().to(device)
+
     fc1, fc2 = get_fc_linears(model)
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        
+        # Modified to get features for SupConLoss
+        if isinstance(model, get_model("strong", num_classes=10).__class__): # Hacky check or just try/except
+             try:
+                 outputs, features = model(inputs, return_features=True)
+                 loss_cls = focal_criterion(outputs, targets)
+                 
+                 # Normalize features for SupCon
+                 features = F.normalize(features, dim=1)
+                 features_sup = features.unsqueeze(1) # SupCon expects [batch, n_views, dim]
+                 loss_supcon = supcon_criterion(features_sup, targets)
+                 
+                 # Increased SupCon weight to encourage better feature separation
+                 loss = loss_cls + 0.5 * loss_supcon
+             except TypeError:
+                 # Fallback for base model which might not support return_features
+                 outputs = model(inputs)
+                 loss = criterion(outputs, targets)
+        else:
+             outputs = model(inputs)
+             loss = criterion(outputs, targets)
+
         loss.backward()
+
+        # Check for NaN loss
+        if torch.isnan(loss):
+            print("Warning: Loss is NaN. Skipping step.")
+            optimizer.zero_grad()
+            continue
+
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # 1) update conv+others (excluding fc weights)
         optimizer.step()
 
         # 2) memristor update for fc weights
         if fcl_state is not None:
-            # grad -> numpy
-            g1 = fc1.weight.grad.detach().cpu().numpy()
-            g2 = fc2.weight.grad.detach().cpu().numpy()
-
-            fcl_state.update("fc1", g1, lr=optimizer.param_groups[0]["lr"], mode=mode)
-            fcl_state.update("fc2", g2, lr=optimizer.param_groups[0]["lr"], mode=mode)
+            # grad -> torch tensor (keep on device)
+            g1 = fc1.weight.grad
+            g2 = fc2.weight.grad
+            
+            # Gradients are already clipped by clip_grad_norm_ above
+            if g1 is not None:
+                fcl_state.update("fc1", g1, lr=optimizer.param_groups[0]["lr"], mode=mode)
+            if g2 is not None:
+                fcl_state.update("fc2", g2, lr=optimizer.param_groups[0]["lr"], mode=mode)
 
             # write back to torch weights (hard overwrite)
             fcl_state.writeback("fc1", fc1.weight)
@@ -409,7 +573,15 @@ def train(epochs=None, batch_size=None, lr=None):
             T_max=getattr(cfg, "LR_SCHED_TMAX", epochs),
         )
     label_smoothing = getattr(cfg, "LABEL_SMOOTHING", 0.0)
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    
+    # Weighted Loss to handle Class 3 (Cat) and 5 (Dog) confusion
+    # Classes: 0:Plane, 1:Car, 2:Bird, 3:Cat, 4:Deer, 5:Dog, 6:Frog, 7:Horse, 8:Ship, 9:Truck
+    # We increase weights for 3 and 5.
+    class_weights = torch.ones(10).to(device)
+    class_weights[3] = 1.5
+    class_weights[5] = 1.5
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
 
     # choose mode here for this script
     print(f"[MODE] UPDATE_MODE={mode}, MAX_PULSES_PER_STEP={fcl_state.max_pulses}, MEM_SCALE={mem_scale}, LS={label_smoothing}")

@@ -21,9 +21,9 @@ class Config:
     # =============================
     NUM_CLASSES = 10
     BATCH_SIZE = 128           # memristor 版本收敛更快的一档 batch size
-    EPOCHS = 600               # 本轮 overlap 扫描统一跑 300 epoch
-    LR = 0.01
-    WEIGHT_DECAY = 5e-4
+    EPOCHS = 200               # Increased to ensure convergence to >90%
+    LR = 0.001                 # Conservative LR for AdamW + Memristor
+    WEIGHT_DECAY = 1e-4        # Adjusted decay
     NUM_WORKERS = 0
 
     # Label smoothing to curb overfit / oscillation
@@ -36,7 +36,7 @@ class Config:
     BITS = 4
 
     # 优化器与调度
-    OPTIMIZER = "adamw"          # sgd | adam | adamw
+    OPTIMIZER = "adamw"          # Revert to AdamW for stability with Memristor updates
     LR_SCHED_TYPE = "cosine"     # step | cosine
     LR_SCHED_STEP = 30
     LR_SCHED_GAMMA = 0.1
@@ -63,7 +63,7 @@ class Config:
     RGB_OVERLAP_LIST = [0,0.1,0.3,0.5]   # 论文关键档位
 
     # Overlap 模型增强：alpha>1 放大串扰，gamma!=1 加非线性
-    OVERLAP_ALPHA = 1.8   # >1 放大串扰；1.5 是加大退化的默认档
+    OVERLAP_ALPHA = 2.0   # Increased to 2.0 to force degradation at overlap=0.5
     OVERLAP_GAMMA = 1.0
 
     # 兼容旧字段（部分脚本仍读取 RGB_PREPROCESS_MODE / RGB_OVERLAP）

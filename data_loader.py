@@ -99,6 +99,14 @@ def get_cifar10_loaders(batch_size=None, num_workers=2, data_dir=None):
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
     ]
+    
+    # AutoAugment for stronger augmentation
+    if getattr(cfg, "USE_AUTO_AUGMENT", True):
+        try:
+            train_transforms.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
+        except AttributeError:
+            pass # older torchvision
+
     if getattr(cfg, "STRONG_AUG", False):
         train_transforms.append(transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2))
     train_transforms.append(transforms.ToTensor())

@@ -1,6 +1,7 @@
-/data
-/exports
-/result
-/result_otest
-/result_otest.rar
-/__pycache__
+data/
+result/
+__pycache__/
+pass/
+experiment_results/
+*.png
+*.pth
